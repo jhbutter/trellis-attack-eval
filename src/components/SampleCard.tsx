@@ -1,6 +1,6 @@
 import { ImageComparePanel } from './ImageComparePanel';
 import { ModelViewer } from './ModelViewer';
-import { RatingPanel } from './RatingPanel';
+import { EffectivenessRatingPanel, ImageAssessmentPanel } from './RatingPanel';
 import type { Sample } from '../types/dataset';
 import type { SampleRatingDraft } from '../types/rating';
 
@@ -31,22 +31,24 @@ export function SampleCard({ sample, rating, onRatingChange }: Props) {
         sampleId={sample.sampleId}
       />
 
+      <ImageAssessmentPanel rating={rating} onChange={onRatingChange} />
+
       <section className="models-section">
         <div className="panel-header">
           <div>
-            <span className="eyebrow">3D Reconstruction Comparison</span>
+            <span className="eyebrow">Step 3 · 3D Reconstruction Comparison</span>
             <h2>原始资产 / 原图重建 / 对抗图重建</h2>
           </div>
-          <span className="pill">统一交互视图</span>
+          <span className="pill">支持旋转缩放</span>
         </div>
         <div className="model-grid">
-          <ModelViewer title="Ground Truth / Reference 3D Asset" src={sample.files.gtModel} />
-          <ModelViewer title="Reconstruction from Original Image" src={sample.files.reconOriModel} />
-          <ModelViewer title="Reconstruction from Adversarial Image" src={sample.files.reconAdvModel} />
+          <ModelViewer title="原始 3D 资产" src={sample.files.gtModel} />
+          <ModelViewer title="原图对应 3D 重建结果" src={sample.files.reconOriModel} />
+          <ModelViewer title="对抗样本图对应 3D 重建结果" src={sample.files.reconAdvModel} />
         </div>
       </section>
 
-      <RatingPanel rating={rating} onChange={onRatingChange} />
+      <EffectivenessRatingPanel rating={rating} onChange={onRatingChange} />
     </div>
   );
 }

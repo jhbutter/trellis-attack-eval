@@ -2,7 +2,9 @@ import type { Batch } from '../types/dataset';
 import type { SampleRatingDraft } from '../types/rating';
 
 function isComplete(rating?: SampleRatingDraft): boolean {
-  return Boolean(rating && rating.visualStealthiness !== undefined && rating.attackEffectiveness !== undefined);
+  if (!rating || rating.imageSimilaritySame === undefined || rating.attackEffectiveness === undefined) return false;
+  if (rating.imageSimilaritySame) return true;
+  return Boolean(rating.selectedOriginalImage && rating.originalConfidence !== undefined);
 }
 
 type Props = {

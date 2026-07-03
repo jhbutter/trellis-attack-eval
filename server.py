@@ -49,6 +49,13 @@ CATEGORIES = [
 ]
 SAMPLES_PER_CATEGORY = 50
 BATCH_SIZE = 10
+MAX_CONCURRENT_USERS = 99
+
+
+def connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
 
 def public_url(path: str | None, fallback: str) -> str:
@@ -149,7 +156,9 @@ BATCH_BY_ID = {batch["batchId"]: batch for batch in BATCHES}
 
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS submissions (
@@ -177,6 +186,9 @@ def init_db() -> None:
                 sample_id TEXT NOT NULL,
                 category TEXT,
                 sample_index INTEGER,
+                image_similarity_same INTEGER,
+                selected_original_image TEXT,
+                original_confidence INTEGER,
                 visual_stealthiness INTEGER NOT NULL,
                 attack_effectiveness INTEGER NOT NULL,
                 comment TEXT,
@@ -189,6 +201,14 @@ def init_db() -> None:
             )
             """
         )
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(ratings)")}
+        for column, column_type in {
+            "image_similarity_same": "INTEGER",
+            "selected_original_image": "TEXT",
+            "original_confidence": "INTEGER",
+        }.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE ratings ADD COLUMN {column} {column_type}")
 
 
 def validate_score(value: object, field_name: str) -> int:
@@ -199,6 +219,30 @@ def validate_score(value: object, field_name: str) -> int:
     if score < 1 or score > 10:
         raise ValueError(f"{field_name} must be an integer from 1 to 10")
     return score
+
+
+def validate_percent(value: object, field_name: str) -> int:
+    try:
+        percent = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer from 0 to 100") from exc
+    if percent < 0 or percent > 100:
+        raise ValueError(f"{field_name} must be an integer from 0 to 100")
+    return percent
+
+
+def parse_similarity(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError("imageSimilaritySame must be true or false")
+
+
+def legacy_visual_score(similarity_same: bool, confidence: int | None) -> int:
+    if similarity_same:
+        return 10
+    if confidence is None:
+        return 1
+    return max(1, min(10, round((100 - confidence) / 10) or 1))
 
 
 def save_submission(payload: dict) -> None:
@@ -215,7 +259,7 @@ def save_submission(payload: dict) -> None:
 
     now = time.time()
     payload_json = json.dumps(payload, ensure_ascii=False)
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO submissions (
@@ -240,7 +284,18 @@ def save_submission(payload: dict) -> None:
         for rating in ratings:
             if not isinstance(rating, dict):
                 raise ValueError("each rating must be an object")
-            visual = validate_score(rating.get("visualStealthiness"), "visualStealthiness")
+            similarity_same = parse_similarity(rating.get("imageSimilaritySame"))
+            selected_original = None
+            original_confidence = None
+            if not similarity_same:
+                selected_original = str(rating.get("selectedOriginalImage") or "")
+                if selected_original not in {"image_a", "image_b"}:
+                    raise ValueError("selectedOriginalImage must be image_a or image_b when imageSimilaritySame is false")
+                original_confidence = validate_percent(rating.get("originalConfidence"), "originalConfidence")
+            visual = validate_score(
+                rating.get("visualStealthiness") or legacy_visual_score(similarity_same, original_confidence),
+                "visualStealthiness",
+            )
             effectiveness = validate_score(rating.get("attackEffectiveness"), "attackEffectiveness")
             rating_id = str(rating.get("ratingId") or f"{submission_id}:{rating.get('sampleId')}")
             sample_id = str(rating.get("sampleId") or "")
@@ -250,15 +305,19 @@ def save_submission(payload: dict) -> None:
                 """
                 INSERT INTO ratings (
                     rating_id, submission_id, session_id, user_id, batch_id, sample_id,
-                    category, sample_index, visual_stealthiness, attack_effectiveness,
+                    category, sample_index, image_similarity_same, selected_original_image,
+                    original_confidence, visual_stealthiness, attack_effectiveness,
                     comment, started_at, submitted_at, user_agent, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, batch_id, sample_id) DO UPDATE SET
                     rating_id = excluded.rating_id,
                     submission_id = excluded.submission_id,
                     user_id = excluded.user_id,
                     category = excluded.category,
                     sample_index = excluded.sample_index,
+                    image_similarity_same = excluded.image_similarity_same,
+                    selected_original_image = excluded.selected_original_image,
+                    original_confidence = excluded.original_confidence,
                     visual_stealthiness = excluded.visual_stealthiness,
                     attack_effectiveness = excluded.attack_effectiveness,
                     comment = excluded.comment,
@@ -277,6 +336,9 @@ def save_submission(payload: dict) -> None:
                     sample_id,
                     rating.get("category"),
                     int(rating.get("sampleIndex") or 0),
+                    1 if similarity_same else 0,
+                    selected_original,
+                    original_confidence,
                     visual,
                     effectiveness,
                     rating.get("comment"),
@@ -290,7 +352,7 @@ def save_submission(payload: dict) -> None:
 
 
 def list_submissions() -> list[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.row_factory = sqlite3.Row
         submission_rows = conn.execute(
             """
@@ -318,6 +380,9 @@ def list_submissions() -> list[dict]:
                     "sampleId": row["sample_id"],
                     "category": row["category"] or "",
                     "sampleIndex": row["sample_index"] or 0,
+                    "imageSimilaritySame": None if row["image_similarity_same"] is None else bool(row["image_similarity_same"]),
+                    "selectedOriginalImage": row["selected_original_image"] or None,
+                    "originalConfidence": row["original_confidence"],
                     "visualStealthiness": row["visual_stealthiness"],
                     "attackEffectiveness": row["attack_effectiveness"],
                     "comment": row["comment"] or "",
@@ -354,6 +419,9 @@ def csv_rows() -> list[list[object]]:
             "sample_id",
             "category",
             "sample_index",
+            "image_similarity_same",
+            "selected_original_image",
+            "original_confidence",
             "visual_stealthiness",
             "attack_effectiveness",
             "comment",
@@ -362,7 +430,7 @@ def csv_rows() -> list[list[object]]:
             "user_agent",
         ]
     ]
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.row_factory = sqlite3.Row
         for row in conn.execute(
             """
@@ -379,6 +447,9 @@ def csv_rows() -> list[list[object]]:
                     row["sample_id"],
                     row["category"] or "",
                     row["sample_index"] or 0,
+                    "" if row["image_similarity_same"] is None else ("yes" if row["image_similarity_same"] else "no"),
+                    row["selected_original_image"] or "",
+                    "" if row["original_confidence"] is None else row["original_confidence"],
                     row["visual_stealthiness"],
                     row["attack_effectiveness"],
                     row["comment"] or "",
@@ -423,7 +494,13 @@ class EvaluationHandler(SimpleHTTPRequestHandler):
 
         try:
             if path == "/api/health":
-                self.send_json({"ok": True, "db": str(DB_PATH), "staticDir": str(DIST_DIR)})
+                self.send_json({
+                    "ok": True,
+                    "db": str(DB_PATH),
+                    "staticDir": str(DIST_DIR),
+                    "maxConcurrentUsers": MAX_CONCURRENT_USERS,
+                    "networkMode": "mainland-compatible-local-assets",
+                })
                 return
             if path == "/api/summary":
                 self.send_json(dataset_summary())
@@ -453,6 +530,14 @@ class EvaluationHandler(SimpleHTTPRequestHandler):
             self.serve_static(path)
         except Exception as exc:  # noqa: BLE001 - surface API errors to the browser.
             self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/"):
+            self.send_response(HTTPStatus.OK)
+            self.end_headers()
+            return
+        self.serve_static(parsed.path, include_body=False)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -500,7 +585,7 @@ class EvaluationHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def serve_static(self, request_path: str) -> None:
+    def serve_static(self, request_path: str, include_body: bool = True) -> None:
         path = unquote(request_path.split("?", 1)[0])
         if path == "/":
             path = "/index.html"
@@ -515,28 +600,40 @@ class EvaluationHandler(SimpleHTTPRequestHandler):
             resolved = candidate.resolve()
             if is_inside(resolved, DIST_DIR) or is_inside(resolved, PUBLIC_DIR):
                 if resolved.is_file():
-                    self.send_file(resolved)
+                    self.send_file(resolved, include_body=include_body)
                     return
 
         index = DIST_DIR / "index.html"
         if index.is_file() and not path.startswith(("/assets/", "/placeholder/", "/dataset/")):
-            self.send_file(index)
+            self.send_file(index, include_body=include_body)
             return
         self.send_error(HTTPStatus.NOT_FOUND, "file not found")
 
-    def send_file(self, path: Path) -> None:
+    def send_file(self, path: Path, include_body: bool = True) -> None:
         ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         if path.suffix == ".glb":
             ctype = "model/gltf-binary"
-        body = path.read_bytes()
+        size = path.stat().st_size
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(size))
+        if is_inside(path, DIST_DIR / "assets"):
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        elif path.name == "index.html":
+            self.send_header("Cache-Control", "no-cache")
+        else:
+            self.send_header("Cache-Control", "public, max-age=300")
         self.end_headers()
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(path.read_bytes())
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+
+class ConcurrentEvaluationServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
 
 
 def is_inside(path: Path, root: Path) -> bool:
@@ -562,9 +659,10 @@ def main() -> None:
     mimetypes.add_type("application/javascript", ".js")
     mimetypes.add_type("text/css", ".css")
     mimetypes.add_type("model/gltf-binary", ".glb")
-    server = ThreadingHTTPServer((args.host, args.port), EvaluationHandler)
+    server = ConcurrentEvaluationServer((args.host, args.port), EvaluationHandler)
     print(f"Trellis attack evaluation platform: http://{args.host}:{args.port}", flush=True)
     print(f"LAN access target: http://192.168.112.249:{args.port}", flush=True)
+    print(f"Concurrent users target: {MAX_CONCURRENT_USERS}", flush=True)
     print(f"SQLite results: {DB_PATH}", flush=True)
     server.serve_forever()
 

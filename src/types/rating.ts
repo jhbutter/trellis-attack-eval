@@ -1,6 +1,10 @@
 export type RatingValue = number | undefined;
+export type CandidateImage = 'image_a' | 'image_b';
 
 export type SampleRatingDraft = {
+  imageSimilaritySame?: boolean;
+  selectedOriginalImage?: CandidateImage;
+  originalConfidence?: number;
   visualStealthiness?: number;
   attackEffectiveness?: number;
   comment?: string;
@@ -14,7 +18,10 @@ export type Rating = {
   sampleId: string;
   category: string;
   sampleIndex: number;
-  visualStealthiness: number;
+  imageSimilaritySame: boolean;
+  selectedOriginalImage?: CandidateImage;
+  originalConfidence?: number;
+  visualStealthiness?: number;
   attackEffectiveness: number;
   comment?: string;
   startedAt: string;

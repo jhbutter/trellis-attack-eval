@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, ArrowRight, Database, Download, Play, RefreshCcw, Save, Send, Trash2, Users } from 'lucide-react';
-import { getBatch, getDatasetSummary, getRandomBatch } from './api/datasetApi';
+import { ArrowLeft, ArrowRight, Box, ChevronLeft, Download, Eye, Gauge, Play, RefreshCcw, Save, Send, Trash2 } from 'lucide-react';
+import { getBatch, getRandomBatch } from './api/datasetApi';
 import { getLocalSubmissions, submitBatchSubmission } from './api/ratingApi';
-import { isSupabaseEnabled } from './api/supabaseClient';
 import { BatchSummary } from './components/BatchSummary';
 import { ProgressBar } from './components/ProgressBar';
 import { SampleCard } from './components/SampleCard';
-import type { Batch, DatasetSummary } from './types/dataset';
+import type { Batch } from './types/dataset';
 import type { BatchSubmission, Rating, SampleRatingDraft } from './types/rating';
 import { downloadText, submissionsToCsv } from './utils/exportCsv';
 import { clearAllLocalData, clearDraft, getBatchStartedAt, getSessionId, readDraft, saveDraft } from './utils/storage';
@@ -16,7 +15,15 @@ import './styles/globals.css';
 type View = 'home' | 'evaluation' | 'results';
 
 function isRatingComplete(rating?: SampleRatingDraft): boolean {
-  return Boolean(rating && rating.visualStealthiness !== undefined && rating.attackEffectiveness !== undefined);
+  if (!rating || rating.imageSimilaritySame === undefined || rating.attackEffectiveness === undefined) return false;
+  if (rating.imageSimilaritySame) return true;
+  return Boolean(rating.selectedOriginalImage && rating.originalConfidence !== undefined);
+}
+
+function deriveLegacyStealthScore(rating: SampleRatingDraft): number {
+  if (rating.imageSimilaritySame) return 10;
+  const confidence = rating.originalConfidence ?? 100;
+  return Math.max(1, Math.min(10, Math.round((100 - confidence) / 10) || 1));
 }
 
 function getInitialView(): View {
@@ -33,27 +40,30 @@ function getBatchIdFromHash(): string | undefined {
 
 export default function App() {
   const [view, setView] = useState<View>(getInitialView);
-  const [summary, setSummary] = useState<DatasetSummary | null>(null);
   const [batch, setBatch] = useState<Batch | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [draft, setDraft] = useState<Record<string, SampleRatingDraft>>({});
   const [submissions, setSubmissions] = useState<BatchSubmission[]>([]);
-  const [serverOnline, setServerOnline] = useState(false);
   const [status, setStatus] = useState<string>('');
 
   useEffect(() => {
-    getDatasetSummary().then(setSummary);
     getLocalSubmissions().then(setSubmissions);
-    fetch('/api/health', { headers: { Accept: 'application/json' } })
-      .then((response) => setServerOnline(response.ok && (response.headers.get('content-type') || '').includes('application/json')))
-      .catch(() => setServerOnline(false));
 
-    const batchId = getBatchIdFromHash();
-    if (batchId) {
-      getBatch(batchId).then((found) => {
-        if (found) loadBatch(found);
-      });
+    function syncRouteFromHash() {
+      const route = getInitialView();
+      const batchId = getBatchIdFromHash();
+      if (route === 'evaluation' && batchId) {
+        getBatch(batchId).then((found) => {
+          if (found) loadBatch(found, false);
+        });
+        return;
+      }
+      setView(route);
     }
+
+    syncRouteFromHash();
+    window.addEventListener('hashchange', syncRouteFromHash);
+    return () => window.removeEventListener('hashchange', syncRouteFromHash);
   }, []);
 
   const completedCount = useMemo(() => {
@@ -70,12 +80,26 @@ export default function App() {
     if (nextView === 'evaluation' && batchId) window.location.hash = `/batch/${batchId}`;
   }
 
-  function loadBatch(nextBatch: Batch) {
+  function loadBatch(nextBatch: Batch, updateRoute = true) {
     setBatch(nextBatch);
     setCurrentIndex(0);
     setDraft(readDraft(nextBatch.batchId));
     getBatchStartedAt(nextBatch.batchId);
-    setRoute('evaluation', nextBatch.batchId);
+    if (updateRoute) setRoute('evaluation', nextBatch.batchId);
+    else setView('evaluation');
+  }
+
+  function goBack() {
+    if (view === 'home') return;
+    const currentHash = window.location.hash;
+    if (window.history.length > 1) {
+      window.history.back();
+      window.setTimeout(() => {
+        if (window.location.hash === currentHash) setRoute('home');
+      }, 120);
+      return;
+    }
+    setRoute('home');
   }
 
   async function startRandomBatch() {
@@ -130,7 +154,10 @@ export default function App() {
         sampleId: sample.sampleId,
         category: sample.category,
         sampleIndex: sample.index,
-        visualStealthiness: item.visualStealthiness!,
+        imageSimilaritySame: item.imageSimilaritySame!,
+        selectedOriginalImage: item.imageSimilaritySame ? undefined : item.selectedOriginalImage,
+        originalConfidence: item.imageSimilaritySame ? undefined : item.originalConfidence,
+        visualStealthiness: deriveLegacyStealthScore(item),
         attackEffectiveness: item.attackEffectiveness!,
         comment: item.comment,
         startedAt,
@@ -204,7 +231,7 @@ export default function App() {
   if (view === 'results') {
     return (
       <main className="app-shell">
-        <TopBar onHome={() => setRoute('home')} onResults={() => setRoute('results')} />
+        <TopBar view={view} onHome={() => setRoute('home')} onBack={goBack} />
         <section className="hero compact-hero">
           <span className="eyebrow">Results</span>
           <h1>评分结果</h1>
@@ -230,12 +257,12 @@ export default function App() {
   if (view === 'evaluation' && batch && currentSample) {
     return (
       <main className="app-shell evaluation-shell">
-        <TopBar onHome={() => setRoute('home')} onResults={() => setRoute('results')} />
+        <TopBar view={view} onHome={() => setRoute('home')} onBack={goBack} />
         <section className="evaluation-header">
           <div>
             <span className="eyebrow">Evaluation Batch</span>
             <h1>{batch.batchId}</h1>
-            <p>当前样本：第 {currentIndex + 1} / {batch.samples.length} 个。请先完成两个评分维度，再进入下一个样本。</p>
+            <p>当前样本：第 {currentIndex + 1} / {batch.samples.length} 个。请按顺序完成图像相似性判断、主观原图选择和 3D 攻击有效性评分。</p>
           </div>
           <div className="header-progress-card">
             <ProgressBar completed={completedCount} total={batch.samples.length} label="当前批次完成度" />
@@ -273,54 +300,38 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
-      <TopBar onHome={() => setRoute('home')} onResults={() => setRoute('results')} />
-      <section className="hero">
+      <main className="app-shell">
+      <TopBar view={view} onHome={() => setRoute('home')} onBack={goBack} />
+      <section className="hero home-hero">
         <div className="hero-copy">
           <span className="eyebrow">Trellis · Single Image 3D Reconstruction</span>
           <h1>对抗攻击效果在线评测平台</h1>
           <p>
-            用于评估对抗样本在 Trellis 单图 3D 重建流程中的攻击隐蔽性与攻击有效性。当前为 Demo 版本，已预留真实数据路径、GLB 预览、批次抽样、评分提交和在线部署接口。
+            平台用于主观评估单图 3D 重建流程中的对抗攻击效果。每次随机抽取 10 个样本，评测者先判断两张输入图是否足以视为同一张图，再查看 3D 重建结果并评价攻击有效性。
           </p>
           <div className="hero-actions">
             <button type="button" className="primary-button" onClick={startRandomBatch}>
-              <Play size={18} /> 随机抽取一个批次开始评测
-            </button>
-            <button type="button" className="secondary-button" onClick={() => setRoute('results')}>
-              <Database size={18} /> 查看已提交结果
+              <Play size={18} /> 开始随机批次评测
             </button>
           </div>
         </div>
-        <div className="hero-card">
-          <div className="status-dot" />
-          <h2>运行状态</h2>
-          <p>{summary?.demoMode ? 'Demo 数据模式' : '真实数据模式'}</p>
-          <p>{serverOnline ? '集中保存：服务器 SQLite 已启用' : '集中保存：未连接服务器 API，使用本地浏览器存储'}</p>
-          <p>{isSupabaseEnabled ? '备用云端：Supabase 已配置' : '访问地址：请使用服务器 IP 与端口，例如 192.168.112.249:7861'}</p>
-        </div>
       </section>
 
-      <section className="stats-grid">
-        <StatCard label="类别数量" value={summary?.categoryCount ?? 16} detail="A1-A10, B1-B6" />
-        <StatCard label="样本总数" value={summary?.totalSamples ?? 800} detail="16 × 50" />
-        <StatCard label="批次数量" value={summary?.totalBatches ?? 80} detail="每批 10 个样本" />
-        <StatCard label="评分维度" value={2} detail="隐蔽性 + 有效性" />
-      </section>
-
-      <section className="instruction-grid">
+      <section className="home-dimension-grid">
         <div className="info-card">
-          <h2>评分维度</h2>
-          <p><strong>攻击隐蔽性：</strong>原图与对抗图越难用肉眼区分，分数越高。</p>
-          <p><strong>攻击有效性：</strong>攻击前后 3D 重建结果差异越大，分数越高。</p>
+          <Eye size={22} />
+          <h2>图像相似性判断</h2>
+          <p>先只观察两张输入图，判断它们的相似度是否足以被认为是同一张图。若不足以判断为同一张图，请选择主观上更像原图的一张，并给出 0% 到 100% 置信度。</p>
         </div>
         <div className="info-card">
-          <h2>在线访问方案</h2>
-          <p>静态演示可部署到 Vercel、Netlify、Cloudflare Pages 或 GitHub Pages。</p>
-          <p>多人集中收集评分结果时，建议配置 Supabase 表作为轻量云端数据库。</p>
+          <Box size={22} />
+          <h2>3D 资产对比</h2>
+          <p>随后查看原始资产、原图重建结果和对抗样本图重建结果。所有 GLB 模型均支持旋转、缩放和重置视角。</p>
         </div>
         <div className="info-card">
-          <h2>真实数据接入</h2>
-          <p>将真实文件放入 <code>public/dataset/类别/编号/</code>，并保持 ori.png、adv.png、gt.glb、recon_ori.glb、recon_adv.glb 命名即可。</p>
+          <Gauge size={22} />
+          <h2>攻击有效性评分</h2>
+          <p>比较原图与对抗样本图对应的 3D 重建结果，主观评价攻击是否造成结构、纹理或语义层面的显著变化，分值范围为 1 到 10。</p>
         </div>
       </section>
       {status && <div className="toast">{status}</div>}
@@ -328,7 +339,7 @@ export default function App() {
   );
 }
 
-function TopBar({ onHome, onResults }: { onHome: () => void; onResults: () => void }) {
+function TopBar({ view, onHome, onBack }: { view: View; onHome: () => void; onBack: () => void }) {
   return (
     <nav className="topbar">
       <button type="button" className="brand" onClick={onHome}>
@@ -336,21 +347,13 @@ function TopBar({ onHome, onResults }: { onHome: () => void; onResults: () => vo
         <span>Trellis Attack Eval</span>
       </button>
       <div className="topbar-actions">
-        <button type="button" onClick={onResults}>结果</button>
-        <a href="https://github.com/" target="_blank" rel="noreferrer"><Database size={16} /> GitHub</a>
-        <span className="cloud-mode"><Users size={16} /> {isSupabaseEnabled ? 'Cloud Sync' : 'Server Sync'}</span>
+        {view !== 'home' && (
+          <button type="button" onClick={onBack}>
+            <ChevronLeft size={16} /> 返回
+          </button>
+        )}
       </div>
     </nav>
-  );
-}
-
-function StatCard({ label, value, detail }: { label: string; value: string | number; detail: string }) {
-  return (
-    <div className="stat-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <p>{detail}</p>
-    </div>
   );
 }
 
@@ -382,7 +385,9 @@ function ResultsTable({ submissions }: { submissions: BatchSubmission[] }) {
               <th>Batch</th>
               <th>Sample</th>
               <th>Category</th>
-              <th>Stealthiness</th>
+              <th>Same Image</th>
+              <th>Picked Original</th>
+              <th>Confidence</th>
               <th>Effectiveness</th>
               <th>Comment</th>
               <th>Submitted</th>
@@ -394,7 +399,9 @@ function ResultsTable({ submissions }: { submissions: BatchSubmission[] }) {
                 <td>{submission.batchId}</td>
                 <td>{rating.sampleId}</td>
                 <td>{rating.category}</td>
-                <td>{rating.visualStealthiness}</td>
+                <td>{rating.imageSimilaritySame === undefined ? '-' : rating.imageSimilaritySame ? 'Yes' : 'No'}</td>
+                <td>{rating.selectedOriginalImage === 'image_a' ? 'Image A' : rating.selectedOriginalImage === 'image_b' ? 'Image B' : '-'}</td>
+                <td>{rating.originalConfidence === undefined ? '-' : `${rating.originalConfidence}%`}</td>
                 <td>{rating.attackEffectiveness}</td>
                 <td>{rating.comment || '-'}</td>
                 <td>{new Date(submission.submittedAt).toLocaleString()}</td>

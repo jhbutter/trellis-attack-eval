@@ -1,5 +1,5 @@
 import '@google/model-viewer';
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Maximize2, RotateCcw } from 'lucide-react';
 import { datasetConfig } from '../data/datasetConfig';
 
@@ -14,6 +14,12 @@ export function ModelViewer({ title, src, fallbackSrc = datasetConfig.placeholde
   const [currentSrc, setCurrentSrc] = useState(src);
   const [viewerKey, setViewerKey] = useState(0);
   const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setCurrentSrc(src);
+    setFailed(false);
+    setViewerKey((value) => value + 1);
+  }, [src]);
 
   function handleError() {
     if (currentSrc !== fallbackSrc) {
